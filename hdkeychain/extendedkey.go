@@ -614,6 +614,79 @@ func NewKeyFromString(key string, net NetworkParams) (*ExtendedKey, error) {
 		depth, childNum, isPrivate), nil
 }
 
+// NewKeyFromStringLoose returns a new extended key instance from a base58-encoded
+// extended key.
+func NewKeyFromStringLoose(key string) (*ExtendedKey, error) {
+	// The provided encoded extended key must not be larger than the maximum
+	// possible encoded size.  The base58-decoded extended key consists of the
+	// serialized payload plus an additional 4 bytes for the checksum.
+	//
+	// Since the encoding converts from base256 to base58, the max possible
+	// number of bytes of output per input byte is log_58(256) ~= 1.37.  Thus, a
+	// reasonable estimate for the max possible encoded size is
+	// ceil(decodedDataLen * 1.37).
+	//
+	// Note that the actual max size in practice is two less than this value due
+	// to rounding and the network prefixes in use, however, this uses the
+	// theoretical max so the code works properly with all prefixes since they
+	// are parameterized.
+	const decodedDataLen = serializedKeyLen + 4
+	const maxKeyLen = (decodedDataLen * 137 / 100) + 1
+	if len(key) > maxKeyLen {
+		return nil, ErrInvalidKeyLen
+	}
+
+	// Decode the extended key and ensure it is the expected length.
+	decoded := base58.Decode(key)
+	if len(decoded) != decodedDataLen {
+		return nil, ErrInvalidKeyLen
+	}
+
+	// The serialized format is:
+	//   version (4) || depth (1) || parent fingerprint (4)) ||
+	//   child num (4) || chain code (32) || key data (33) || checksum (4)
+
+	// Split the payload and checksum up and ensure the checksum matches.
+	payload := decoded[:len(decoded)-4]
+	checkSum := decoded[len(decoded)-4:]
+	expectedCheckSum := doubleBlake256Cksum(payload)
+	if !bytes.Equal(checkSum, expectedCheckSum) {
+		return nil, ErrBadChecksum
+	}
+
+	version := *(*[4]byte)(payload[:4])
+
+	// Deserialize the remaining payload fields.
+	depth := uint16(payload[4:5][0])
+	parentFP := payload[5:9]
+	childNum := binary.BigEndian.Uint32(payload[9:13])
+	chainCode := payload[13:45]
+	keyData := payload[45:78]
+
+	// The key data is a private key if it starts with 0x00.  Serialized
+	// compressed pubkeys either start with 0x02 or 0x03.
+	isPrivate := keyData[0] == 0x00
+	if isPrivate {
+		// Ensure the private key is valid.  It must be within the range
+		// of the order of the secp256k1 curve and not be 0.
+		keyData = keyData[1:]
+		var priv secp256k1.ModNScalar
+		if overflow := priv.SetByteSlice(keyData); overflow || priv.IsZero() {
+			return nil, ErrUnusableSeed
+		}
+	} else {
+		// Ensure the public key parses correctly and is actually on the
+		// secp256k1 curve.
+		_, err := secp256k1.ParsePubKey(keyData)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return newExtendedKey(version, version, keyData, chainCode, parentFP,
+		depth, childNum, isPrivate), nil
+}
+
 // GenerateSeed returns a cryptographically secure random seed that can be used
 // as the input for the NewMaster function to generate a new master node.
 //
